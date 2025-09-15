@@ -106,37 +106,72 @@ impl HardwareCcm {
         ciphertext: &[u8],
         received_mic: &[u8; 4],
     ) -> Result<[u8; 64], ()> {
-        // For this simplified implementation, we'll use the ECB peripheral
-        // to recreate the keystream and verify the MIC
+        // This must match the sender's CCM implementation exactly
 
-        // Verify MIC first by recreating it
-        let mut mac_input = [0u8; 16];
-        mac_input[..13].copy_from_slice(nonce);
-        mac_input[13] = aad.len() as u8;
-        mac_input[14] = ciphertext.len() as u8;
-        mac_input[15] = 0x01; // Version
-
-        let mac_block = self.aes.encrypt_block(key, &mac_input);
-
-        // Check if MIC matches (first 4 bytes)
-        if &mac_block[..4] != received_mic {
-            return Err(());
-        }
-
-        // MIC is valid, now decrypt the ciphertext
+        // First, decrypt the ciphertext to get plaintext for MAC calculation
         let mut plaintext = [0u8; 64];
         let len = ciphertext.len().min(64);
 
-        // Generate keystream
-        let mut keystream_input = [0u8; 16];
-        keystream_input[..13].copy_from_slice(nonce);
-        keystream_input[15] = 0x01; // Counter
+        // Generate keystream blocks (same as sender)
+        for block_idx in 0..(len + 15) / 16 {
+            let mut counter_block = [0u8; 16];
+            counter_block[0] = 0x01; // CCM counter block flags
+            counter_block[1..14].copy_from_slice(nonce);
+            counter_block[14] = (block_idx >> 8) as u8;
+            counter_block[15] = (block_idx + 1) as u8; // Counter starts at 1
 
-        let keystream = self.aes.encrypt_block(key, &keystream_input);
+            let keystream_block = self.aes.encrypt_block(key, &counter_block);
 
-        // XOR ciphertext with keystream to get plaintext
-        for i in 0..len {
-            plaintext[i] = ciphertext[i] ^ keystream[i % 16];
+            // XOR ciphertext with keystream to get plaintext
+            let start_idx = block_idx * 16;
+            let end_idx = (start_idx + 16).min(len);
+
+            for i in start_idx..end_idx {
+                plaintext[i] = ciphertext[i] ^ keystream_block[i - start_idx];
+            }
+        }
+
+        // Now compute MAC using the decrypted plaintext (same as sender)
+        let mut mac_input = [0u8; 16];
+
+        // CCM authentication field construction (same as sender)
+        mac_input[0] = 0x01; // Flags: AAD present, M=4 (MIC length), L=2
+        mac_input[1..14].copy_from_slice(nonce);
+        mac_input[14] = (len >> 8) as u8;
+        mac_input[15] = len as u8;
+
+        let mac_block1 = self.aes.encrypt_block(key, &mac_input);
+
+        // XOR with AAD for authentication (same as sender)
+        let mut mac_block2 = [0u8; 16];
+        mac_block2[0] = aad.len() as u8;
+        let aad_len = aad.len().min(15);
+        mac_block2[1..=aad_len].copy_from_slice(&aad[..aad_len]);
+
+        // XOR previous result with AAD block
+        for i in 0..16 {
+            mac_block2[i] ^= mac_block1[i];
+        }
+
+        let mac_result = self.aes.encrypt_block(key, &mac_block2);
+
+        // Encrypt the MAC with counter 0 to get the expected MIC (same as sender)
+        let mut counter_zero = [0u8; 16];
+        counter_zero[0] = 0x01;
+        counter_zero[1..14].copy_from_slice(nonce);
+        // counter_zero[14] and [15] remain 0
+
+        let mac_keystream = self.aes.encrypt_block(key, &counter_zero);
+
+        // XOR MAC with keystream to get expected MIC
+        let mut expected_mic = [0u8; 4];
+        for i in 0..4 {
+            expected_mic[i] = mac_result[i] ^ mac_keystream[i];
+        }
+
+        // Verify MIC matches
+        if expected_mic != *received_mic {
+            return Err(());
         }
 
         Ok(plaintext)
@@ -267,13 +302,10 @@ fn check_sequence_number(sequence: u32) -> bool {
 async fn main(_spawner: Spawner) {
     let mut config = Config::default();
     config.hfclk_source = HfclkSource::ExternalXtal;
-    let peripherals = embassy_nrf::init(config);
+    let mut peripherals = embassy_nrf::init(config);
 
     // assumes LED on P0_15 with active-high polarity
     let mut gpo_led = Output::new(peripherals.P0_15, Level::Low, OutputDrive::Standard);
-
-    let mut radio = ieee802154::Radio::new(peripherals.RADIO, Irqs);
-    radio.set_channel(20); // Using channel 20 as requested
 
     let mut packet = Packet::new();
 
@@ -283,13 +315,39 @@ async fn main(_spawner: Spawner) {
     defmt::info!("🔒 Hardware-accelerated IEEE 802.15.4 Receiver starting on channel 20");
     defmt::info!("🚀 Using nRF52840 ECB/CCM hardware crypto acceleration");
     defmt::info!("📡 Waiting for hardware-authenticated messages...");
+    defmt::info!("⚡ Power-saving mode: Drop and re-init radio after each packet (sender transmits every 2s)");
 
     loop {
-        gpo_led.set_low();
-        let rv = radio.receive(&mut packet).await;
-        gpo_led.set_high();
+        // Receive packet in its own block - radio AND peripheral will be dropped when exiting this block
+        let packet_result = {
+            // Power up radio peripheral before creating radio instance
+            embassy_nrf::pac::RADIO.power().write(|w| w.set_power(true));
+            defmt::debug!("🔌 Radio peripheral powered up via PAC");
 
-        match rv {
+            // Create fresh radio instance for this receive cycle
+            defmt::debug!("📡 Creating fresh radio instance...");
+            let radio_peri = peripherals.RADIO.reborrow();
+            let mut radio = ieee802154::Radio::new(radio_peri, Irqs);
+            radio.set_channel(20); // Using channel 20 as requested
+
+            gpo_led.set_low();
+            let rv = radio.receive(&mut packet).await;
+            gpo_led.set_high();
+
+            // Explicitly drop both radio and peripheral reference
+            drop(radio);
+            // Note: radio_peri is automatically dropped here since it's not reborrowed
+            defmt::debug!("📻 Radio and peripheral reference dropped...");
+
+            // Force radio peripheral to power down using PAC
+            embassy_nrf::pac::RADIO.power().write(|w| w.set_power(false));
+            defmt::debug!("🔌 Radio peripheral powered down via PAC");
+
+            rv
+        }; // Radio peripheral is now completely powered down
+
+        // Process the received packet (radio is no longer consuming power)
+        match packet_result {
             Err(_) => defmt::error!("receive() Err"),
             Ok(_) => {
                 let lqi = packet.lqi();
@@ -317,7 +375,7 @@ async fn main(_spawner: Spawner) {
                         // Check if this is a startup packet
                         if let Some(startup_seq) = is_startup_packet(&plaintext) {
                             handle_startup_packet(startup_seq, &plaintext);
-                            continue;
+                            continue; // Continue to next packet
                         }
                     }
 
@@ -341,7 +399,7 @@ async fn main(_spawner: Spawner) {
                             defmt::error!(
                                 "❌ Sequence number check failed - message rejected (possible replay attack)"
                             );
-                            continue;
+                            continue; // Continue to next packet
                         }
 
                         // Message is authenticated and fresh - process it
@@ -414,8 +472,14 @@ async fn main(_spawner: Spawner) {
                         lqi
                     );
                 }
+
+                // After successfully receiving and processing a packet,
+                // sleep for 1.5s since sender transmits every 2s
+                defmt::debug!("💤 Packet processed, sleeping for 1.5s to save power...");
+                Timer::after_millis(1500).await;
+                defmt::debug!("⏰ Wake up, ready for next packet");
             }
         }
-        Timer::after_millis(100u64).await;
+        // No delay here - go back to listening immediately if no packet or on error
     }
 }
