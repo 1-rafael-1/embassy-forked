@@ -778,9 +778,16 @@ impl<'d, U: UarteInstance, T: TimerInstance> BufferedUarteRx<'d, U, T> {
     }
 
     /// we are ready to read if there is data in the buffer
+    ///
+    /// Uses atomic ordering to avoid race conditions with interrupt handler.
+    /// Acquire ordering on write position ensures we see all data that was
+    /// written before any concurrent updates.
     fn read_ready() -> Result<bool, Error> {
         let state = U::buffered_state();
-        Ok(!state.rx_buf.is_empty())
+        let read_pos = state.rx_buf.end.load(core::sync::atomic::Ordering::Acquire);
+        let write_pos = state.rx_buf.start.load(core::sync::atomic::Ordering::Relaxed);
+        // We have data if the write position is not equal to the read position.
+        Ok(write_pos != read_pos)
     }
 }
 
